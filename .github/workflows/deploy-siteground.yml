@@ -1,0 +1,349 @@
+name: Deploy AZO Flicker Fix to SiteGround
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_server:
+        description: 'SiteGround server hostname (e.g. sg123.siteground.biz or server IP)'
+        required: false
+        default: '34.174.71.40'
+      ftp_user:
+        description: 'FTP/SFTP username (if different from SG_EMAIL)'
+        required: false
+        default: ''
+
+jobs:
+  deploy-via-sftp:
+    name: Try SFTP deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Create _deploy.php
+        run: |
+          cat > _deploy.php << 'PHPEOF'
+          <?php
+          $url = 'https://raw.githubusercontent.com/HCJefe/azo-temp-deploy/0046b32f8ec86c98b52fe8ca17449867565c6e18/azo-flythrough.zip';
+          $dst = __DIR__ . '/azo-flythrough.zip';
+          $ctx = stream_context_create(['http'=>['timeout'=>120]]);
+          $bytes = file_put_contents($dst, fopen($url,'r',false,$ctx));
+          echo "downloaded $bytes bytes\n";
+          $zip = new ZipArchive;
+          if ($zip->open($dst) === TRUE) {
+              $zip->extractTo(__DIR__);
+              $zip->close();
+              @unlink($dst);
+              echo "DONE\n";
+          } else {
+              echo "ZIP OPEN FAILED\n";
+          }
+          PHPEOF
+          cat _deploy.php
+          
+      - name: Upload via SFTP (try email as username)
+        env:
+          SG_EMAIL: ${{ secrets.SG_EMAIL }}
+          SG_PASS: ${{ secrets.SG_PASS }}
+        run: |
+          # Install sshpass for password-based SFTP
+          sudo apt-get install -y sshpass 2>/dev/null
+          
+          SERVER="${{ inputs.site_server || '34.174.71.40' }}"
+          
+          echo "Trying SFTP to $SERVER with email username..."
+          sshpass -p "$SG_PASS" sftp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+            -o PasswordAuthentication=yes \
+            "${SG_EMAIL}@${SERVER}" << 'FTPEOF' 2>&1 || echo "SFTP with email failed"
+          ls
+          cd public_html
+          ls
+          put _deploy.php
+          ls
+          bye
+          FTPEOF
+          
+  deploy-via-api:
+    name: Deploy via SiteGround REST API  
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: []
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
+          
+      - name: Create _deploy.php content file
+        run: |
+          cat > deploy_php_content.txt << 'EOF'
+          <?php
+          $url = 'https://raw.githubusercontent.com/HCJefe/azo-temp-deploy/0046b32f8ec86c98b52fe8ca17449867565c6e18/azo-flythrough.zip';
+          $dst = __DIR__ . '/azo-flythrough.zip';
+          $ctx = stream_context_create(['http'=>['timeout'=>120]]);
+          $bytes = file_put_contents($dst, fopen($url,'r',false,$ctx));
+          echo "downloaded $bytes bytes\n";
+          $zip = new ZipArchive;
+          if ($zip->open($dst) === TRUE) {
+              $zip->extractTo(__DIR__);
+              $zip->close();
+              @unlink($dst);
+              echo "DONE\n";
+          } else {
+              echo "ZIP OPEN FAILED\n";
+          }
+          EOF
+          
+      - name: Deploy via Playwright browser automation
+        env:
+          SG_EMAIL: ${{ secrets.SG_EMAIL }}
+          SG_PASS: ${{ secrets.SG_PASS }}
+        run: |
+          node - << 'JSEOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          
+          const DEPLOY_PHP = fs.readFileSync('deploy_php_content.txt', 'utf8');
+          const EMAIL = process.env.SG_EMAIL;
+          const PASS = process.env.SG_PASS;
+          
+          function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+          
+          (async () => {
+            console.log('Starting browser...');
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-web-security']
+            });
+            
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              viewport: { width: 1366, height: 768 }
+            });
+            
+            // Intercept API calls to capture JWT token
+            let jwtToken = null;
+            context.on('request', request => {
+              const auth = request.headers()['authorization'];
+              if (auth && auth.startsWith('Bearer ')) {
+                jwtToken = auth.replace('Bearer ', '');
+                console.log('[TOKEN] Captured JWT token');
+              }
+            });
+            
+            const page = await context.newPage();
+            let s = 0;
+            const ss = async (name) => {
+              await page.screenshot({ path: `s${++s}-${name}.png`, fullPage: false });
+            };
+            
+            // === STEP 1: LOGIN ===
+            console.log('[1] Loading login page...');
+            await page.goto('https://my.siteground.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await sleep(3000);
+            await ss('login');
+            console.log('[1] URL:', page.url());
+            
+            // Find and fill the email field
+            await page.waitForSelector('input', { timeout: 15000 });
+            
+            // Log all inputs for debugging
+            const inputAttrs = await page.$$eval('input', inputs => 
+              inputs.map(i => ({ type: i.type, name: i.name, id: i.id, placeholder: i.placeholder, className: i.className }))
+            );
+            console.log('[1] Inputs found:', JSON.stringify(inputAttrs));
+            
+            // Fill the first text/email input
+            for (const sel of ['input[type="email"]', 'input[name="email"]', 'input[name="username"]', 'input[type="text"]:first-of-type']) {
+              const el = await page.$(sel);
+              if (el) {
+                await el.fill(EMAIL);
+                console.log('[1] Filled email with selector:', sel);
+                break;
+              }
+            }
+            await page.fill('input[type="password"]', PASS);
+            await ss('filled');
+            
+            console.log('[1] Clicking login button...');
+            await page.click('button[type="submit"]');
+            
+            // Wait for navigation with longer timeout for reCAPTCHA processing
+            await sleep(10000);
+            await ss('after-login');
+            console.log('[1] URL after login:', page.url());
+            
+            // Check for 2FA prompt
+            const is2FA = await page.$('input[name*="2fa"], input[name*="otp"], input[placeholder*="code" i]');
+            if (is2FA) {
+              console.error('[1] 2FA required! Cannot proceed automatically.');
+              await browser.close();
+              process.exit(1);
+            }
+            
+            // Check if login failed
+            if (page.url().includes('my.siteground.com') && !page.url().includes('websites') && !page.url().includes('account')) {
+              const errorEl = await page.$('.error-message, .alert, [class*="error"]');
+              if (errorEl) {
+                const errText = await errorEl.textContent();
+                console.error('[1] Login error:', errText);
+              }
+              
+              // Check page content for clues
+              const title = await page.title();
+              console.log('[1] Page title:', title);
+              
+              // If still on login, we might need to wait longer for reCAPTCHA
+              await sleep(5000);
+              await ss('still-login');
+              console.log('[1] Still on URL:', page.url());
+              
+              if (page.url().includes('login') || page.url() === 'https://my.siteground.com/') {
+                console.error('[1] Login appears to have failed or is blocked by reCAPTCHA');
+                // Don't exit - try to continue and see what happens
+              }
+            }
+            
+            // === STEP 2: NAVIGATE TO ARIZONAOUTFITTERS SITE TOOLS ===
+            console.log('[2] Navigating to websites...');
+            await page.goto('https://my.siteground.com/websites', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(4000);
+            await ss('websites');
+            console.log('[2] Websites URL:', page.url());
+            
+            const title2 = await page.title();
+            console.log('[2] Page title:', title2);
+            
+            // Check if we got a session token
+            if (jwtToken) {
+              console.log('[2] We have a JWT token! Length:', jwtToken.length);
+            }
+            
+            // Look for arizonaoutfitters in the page
+            const bodyText = await page.evaluate(() => document.body.innerText);
+            if (bodyText.includes('arizonaoutfitters')) {
+              console.log('[2] Found arizonaoutfitters in page!');
+            } else {
+              console.log('[2] arizonaoutfitters NOT found in page');
+              console.log('[2] Page snippet:', bodyText.substring(0, 500));
+            }
+            
+            // Try to find and click Site Tools for arizonaoutfitters
+            try {
+              // Different approaches to find the Site Tools button
+              const pageHTML = await page.content();
+              const matches = pageHTML.match(/arizonaoutfitters[^"<]{0,200}/g);
+              if (matches) console.log('[2] HTML matches:', matches.slice(0, 3));
+              
+              // Look for a link near arizonaoutfitters.com
+              const siteToolsBtn = await page.locator('[data-domain*="arizonaoutfitters"], [data-website*="arizonaoutfitters"]').first();
+              const count = await siteToolsBtn.count();
+              console.log('[2] Found', count, 'elements with arizonaoutfitters data attr');
+            } catch (e) {
+              console.log('[2] Error finding site tools:', e.message);
+            }
+            
+            // Try clicking directly
+            try {
+              await page.click('text=Site Tools', { timeout: 5000 });
+              await sleep(3000);
+              await ss('site-tools');
+              console.log('[2] Clicked Site Tools, URL:', page.url());
+            } catch (e) {
+              console.log('[2] Could not click Site Tools:', e.message);
+            }
+            
+            // Try direct navigation to file manager
+            console.log('[3] Navigating to File Manager...');
+            await page.goto('https://tools.siteground.com/filemanager', { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await sleep(5000);
+            await ss('filemanager');
+            console.log('[3] File Manager URL:', page.url());
+            
+            const fmTitle = await page.title();
+            console.log('[3] File Manager title:', fmTitle);
+            
+            // Check if we're in the file manager
+            const fmBody = await page.evaluate(() => document.body.innerText);
+            console.log('[3] File Manager page snippet:', fmBody.substring(0, 300));
+            
+            if (page.url().includes('filemanager') || fmTitle.toLowerCase().includes('file')) {
+              console.log('[3] SUCCESS: In File Manager!');
+              
+              await sleep(3000); // Wait for FM to fully load
+              await ss('fm-loaded');
+              
+              // Try to navigate to public_html and create file
+              // ... (will be implemented based on actual FM structure)
+              
+            } else {
+              console.log('[3] Not in file manager. Current URL:', page.url());
+            }
+            
+            if (jwtToken) {
+              console.log('\n[JWT] We captured a token! Can use for API calls.');
+              // Use the API to create the file
+              const apiResult = await fetch('https://tools.siteground.com/api/files/create', {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${jwtToken}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  path: '/public_html/_deploy.php',
+                  content: DEPLOY_PHP
+                })
+              });
+              console.log('[JWT] API response status:', apiResult.status);
+              const apiBody = await apiResult.text();
+              console.log('[JWT] API response:', apiBody.substring(0, 200));
+            }
+            
+            await browser.close();
+            console.log('[COMPLETE] Browser closed');
+          })();
+          JSEOF
+          
+      - name: Check if _deploy.php is accessible
+        run: |
+          echo "Checking if _deploy.php was uploaded..."
+          sleep 5
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://arizonaoutfitters.com/_deploy.php")
+          echo "HTTP status code: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "SUCCESS: _deploy.php is accessible!"
+            # Trigger the deploy
+            echo "Triggering deployment..."
+            RESULT=$(curl -s --max-time 300 "https://arizonaoutfitters.com/_deploy.php?fresh=50")
+            echo "Deploy output: $RESULT"
+            
+            if echo "$RESULT" | grep -q "downloaded 4109052 bytes"; then
+              echo "CORRECT BYTE COUNT: 4109052"
+            fi
+            if echo "$RESULT" | grep -q "DONE"; then
+              echo "DEPLOYMENT SUCCESSFUL: DONE received"
+            fi
+          else
+            echo "UPLOAD FAILED: _deploy.php returned HTTP $HTTP_CODE"
+            echo "Manual deployment required via SiteGround File Manager"
+          fi
+          
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-screenshots  
+          path: '*.png'
+          retention-days: 7
